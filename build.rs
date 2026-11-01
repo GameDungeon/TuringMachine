@@ -48,7 +48,11 @@ fn parse_program(input: &str) -> Vec<(Instruction, Instruction)> {
         .collect()
 }
 
-fn generate_state_inner(instruction: &Instruction, cur_symbol: bool) -> TokenStream {
+fn generate_state_inner(
+    instruction: &Instruction,
+    cur_symbol: bool,
+    cur_state: &str,
+) -> TokenStream {
     match instruction {
         Instruction::Instruction {
             symbol,
@@ -63,7 +67,7 @@ fn generate_state_inner(instruction: &Instruction, cur_symbol: bool) -> TokenStr
             };
 
             if *state == 'Z' {
-                quote! { step_budget - 1 }
+                quote! { (step_budget - 1, #cur_state, #cur_symbol) }
             } else {
                 let next_state = format_ident!("state_{}", &state.to_ascii_lowercase());
                 quote! {
@@ -73,19 +77,19 @@ fn generate_state_inner(instruction: &Instruction, cur_symbol: bool) -> TokenStr
                 }
             }
         }
-        Instruction::Halt => quote! { step_budget - 1 },
+        Instruction::Halt => quote! { (step_budget - 1, #cur_state, #cur_symbol) },
     }
 }
 
 fn generate_state_function(instructions: &(Instruction, Instruction), state: &str) -> TokenStream {
-    let inner_zero = generate_state_inner(&instructions.0, false);
-    let inner_one = generate_state_inner(&instructions.1, true);
+    let inner_zero = generate_state_inner(&instructions.0, false, state);
+    let inner_one = generate_state_inner(&instructions.1, true, state);
 
     let fn_name = format_ident!("state_{}", state);
 
     quote! {
-        fn #fn_name(mut head: Head, tape: &mut Tape, step_budget: u64) -> u64 {
-            if step_budget == 0 { return 0; }
+        fn #fn_name(mut head: Head, tape: &mut Tape, step_budget: u64) -> (u64, &str, bool) {
+            if step_budget == 0 { return (0, "Z", false); }
 
             if head.read() {
                 #inner_one
@@ -96,7 +100,7 @@ fn generate_state_function(instructions: &(Instruction, Instruction), state: &st
     }
 }
 
-fn generate_machine(instructions: Vec<(Instruction, Instruction)>) -> TokenStream {
+fn generate_machine(instructions: Vec<(Instruction, Instruction)>, machine: String) -> TokenStream {
     let states = ["a", "b", "c", "d", "e", "f", "g", "h"];
 
     let state_functions = instructions
@@ -105,8 +109,11 @@ fn generate_machine(instructions: Vec<(Instruction, Instruction)>) -> TokenStrea
         .map(|(i, inst)| generate_state_function(inst, states[i]));
 
     quote! {
-        pub fn run_machine(head: Head, tape: &mut Tape, step_budget: u64) -> u64 {
-            step_budget - state_a(head, tape, step_budget)
+        const MACHINE: &str = #machine;
+
+        pub fn run_machine(head: Head, tape: &mut Tape, step_budget: u64) -> (u64, &str, bool) {
+            let (steps, state, symbol) = state_a(head, tape, step_budget);
+            (step_budget - steps, state, symbol)
         }
 
         #(#state_functions)*
@@ -117,7 +124,7 @@ fn main() {
     let machine = std::env::var("MACHINE").expect("Must have a machine set");
 
     let program = parse_program(&machine);
-    let tokens = generate_machine(program);
+    let tokens = generate_machine(program, machine);
 
     let file = syn::parse2(tokens).expect("generated invalid Rust");
     let formatted = prettyplease::unparse(&file);

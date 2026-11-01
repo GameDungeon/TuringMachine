@@ -11,5 +11,9 @@ devenv.local.yaml
 
 
 # Added by cargo
-
 /target
+
+# scripts
+failed_machines.txt
+machine_output.txt
+machines.txt
