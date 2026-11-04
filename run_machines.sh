@@ -19,7 +19,7 @@ RUNNING=0
 run_machine() {
   local machine="$1"
 
-  if ! MACHINE="$machine" cargo run >/dev/null 2>&1; then
+  if ! MACHINE="$machine" cargo run --release >/dev/null 2>&1; then
     echo "$machine" >>"$FAIL_LOG"
   fi
 }

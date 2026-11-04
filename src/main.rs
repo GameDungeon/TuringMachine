@@ -14,7 +14,7 @@ include!(concat!(env!("OUT_DIR"), "/machine.rs"));
 
 fn main() {
     // let start = Instant::now();
-    step_for(1_000_000_000);
+    step_for(100_000_000_000);
     // let duration = start.elapsed();
     // dbg!(duration);
 }
