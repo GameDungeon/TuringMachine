@@ -2,6 +2,7 @@
 name = "TuringMachine"
 version = "0.1.0"
 edition = "2024"
+build = "compile/build.rs"
 
 [profile.release]
 opt-level = 3
@@ -16,5 +17,6 @@ prettyplease = {version = "0.3.0", features = ["verbatim"] }
 proc-macro2 = "1.0.107"
 quote = "1.0.47"
 syn = { version = "3.0.9", features = ["full"] }
+strum = { version = "0.28", features = ["derive"] }
 
 

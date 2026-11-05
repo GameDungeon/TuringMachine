@@ -27,20 +27,192 @@ impl Head {
     }
 
     #[inline(always)]
-    pub fn shift<const RIGHT: bool>(&mut self) -> bool {
+    pub fn flip(&mut self) {
+        self.slot_value ^= self.mask;
+    }
+
+    #[inline(always)]
+    pub fn shift<const RIGHT: bool>(&mut self, tape: &mut Tape) {
         if RIGHT {
             self.mask <<= 1;
         } else {
             self.mask >>= 1;
         }
 
-        self.mask == 0
+        if self.mask == 0 {
+            tape.cross::<RIGHT>(self)
+        }
+    }
+
+    // #[inline(always)]
+    // pub fn shift_rule<const RIGHT: bool, const SYMBOL: bool, const WRITE: bool>(
+    //     &mut self,
+    //     tape: &mut Tape,
+    //     mut budget: u64,
+    // ) -> u64 {
+    //     let start = budget;
+    //     let full: u64 = if SYMBOL { u64::MAX } else { 0 };
+    //     let filled: u64 = if WRITE { u64::MAX } else { 0 };
+
+    //     loop {
+    //         let p = self.mask.trailing_zeros();
+    //         let diff = if SYMBOL {
+    //             !self.slot_value
+    //         } else {
+    //             self.slot_value
+    //         };
+
+    //         let (dist, to_edge) = if RIGHT {
+    //             ((diff >> p).trailing_zeros(), 64 - p)
+    //         } else {
+    //             ((diff << (63 - p)).leading_zeros(), p + 1)
+    //         };
+
+    //         let n = (dist.min(to_edge)).min(budget as u32);
+    //         if n == 0 {
+    //             return start - budget;
+    //         }
+    //         budget -= n as u64;
+
+    //         if SYMBOL != WRITE {
+    //             let ones = u64::MAX >> (64 - n);
+    //             let range = if RIGHT {
+    //                 ones << p
+    //             } else {
+    //                 ones << (p + 1 - n)
+    //             };
+
+    //             if WRITE {
+    //                 self.slot_value |= range
+    //             } else {
+    //                 self.slot_value &= !range
+    //             }
+    //         }
+
+    //         if n == to_edge {
+    //             tape.cross::<RIGHT>(self);
+
+    //             // Tight loop: skip whole uniform words while the budget covers all 64 cells.
+    //             while self.slot_value == full && budget >= 64 {
+    //                 if SYMBOL != WRITE {
+    //                     self.slot_value = filled;
+    //                 }
+    //                 tape.cross::<RIGHT>(self); // stores `filled`, loads the next word
+    //                 budget -= 64;
+    //             }
+    //             // Fall through to the general scan: handles a mixed word, a word that
+    //             // starts with a different symbol (n == 0 -> return), or budget < 64.
+    //         } else {
+    //             if RIGHT {
+    //                 self.mask <<= n
+    //             } else {
+    //                 self.mask >>= n
+    //             }
+    //             return start - budget;
+    //         }
+    //     }
+    // }
+
+    #[inline(always)]
+    pub fn shift_rule<const RIGHT: bool, const SYMBOL: bool, const WRITE: bool>(
+        &mut self,
+        tape: &mut Tape,
+        mut budget: u64,
+    ) -> u64 {
+        let filled: u64 = if WRITE { u64::MAX } else { 0 };
+
+        // Phase 1: finish the word we're in (arbitrary bit position).
+        {
+            let p = self.mask.trailing_zeros();
+            let diff = if SYMBOL {
+                !self.slot_value
+            } else {
+                self.slot_value
+            };
+            let (dist, to_edge) = if RIGHT {
+                ((diff >> p).trailing_zeros(), 64 - p)
+            } else {
+                ((diff << (63 - p)).leading_zeros(), p + 1)
+            };
+
+            // Clamp in u64 first: `budget as u32` would truncate.
+            let n = dist.min(to_edge).min(budget.min(64) as u32);
+            if n == 0 {
+                return budget;
+            }
+            budget -= n as u64;
+
+            if SYMBOL != WRITE {
+                let ones = u64::MAX >> (64 - n); // n in 1..=64
+                let range = if RIGHT {
+                    ones << p
+                } else {
+                    ones << (p + 1 - n)
+                };
+                if WRITE {
+                    self.slot_value |= range
+                } else {
+                    self.slot_value &= !range
+                }
+            }
+
+            if n < to_edge {
+                if RIGHT {
+                    self.mask <<= n
+                } else {
+                    self.mask >>= n
+                }
+                return budget;
+            }
+            tape.cross::<RIGHT>(self); // mask is now on the entering edge
+        }
+
+        // Phase 2: the head is on the entering edge of a fresh word, so all positions are constants.
+        loop {
+            let diff = if SYMBOL {
+                !self.slot_value
+            } else {
+                self.slot_value
+            };
+
+            if diff == 0 && budget >= 64 {
+                if SYMBOL != WRITE {
+                    self.slot_value = filled;
+                }
+                tape.cross::<RIGHT>(self);
+                budget -= 64;
+                continue;
+            }
+
+            // The run ends inside this word. Either diff != 0 (dist < 64) or budget < 64,
+            // so n < 64 and every shift below is in range.
+            let dist = if RIGHT {
+                diff.trailing_zeros()
+            } else {
+                diff.leading_zeros()
+            };
+            let n = dist.min(budget.min(64) as u32);
+            budget -= n as u64;
+
+            if SYMBOL != WRITE {
+                let range = if RIGHT {
+                    (1u64 << n) - 1
+                } else {
+                    !(u64::MAX >> n)
+                };
+                if WRITE {
+                    self.slot_value |= range
+                } else {
+                    self.slot_value &= !range
+                }
+            }
+            self.mask = if RIGHT { 1u64 << n } else { (1u64 << 63) >> n };
+            return budget;
+        }
     }
 }
 
 pub struct Tape {
-    slot_idx: usize,
-    tape_side: bool,
     left_tape: Vec<u64>,
     right_tape: Vec<u64>,
 }
@@ -48,8 +220,6 @@ pub struct Tape {
 impl Tape {
     pub fn new() -> Self {
         Self {
-            slot_idx: 0,
-            tape_side: true,
             left_tape: vec![0],
             right_tape: vec![0],
         }
@@ -57,59 +227,14 @@ impl Tape {
 
     #[inline(always)]
     pub fn cross<const RIGHT: bool>(&mut self, h: &mut Head) {
-        let outward = self.tape_side == RIGHT;
-
-        let tape = if self.tape_side {
-            &mut self.right_tape
-        } else {
-            &mut self.left_tape
-        };
-
-        // inward from index 0 means switching sides
-        if !outward && self.slot_idx == 0 {
-            *h = self.side_cross::<RIGHT>(*h);
-            return;
-        }
-
-        unsafe { *tape.get_unchecked_mut(self.slot_idx) = h.slot_value };
-
-        // For some reason replacing next with self.slot_idx tanks performance
-        let next = if outward {
-            let next = self.slot_idx + 1;
-
-            // Can only grow when moving outwards
-            if next == tape.len() {
-                tape.push(0);
-            }
-
-            next
-        } else {
-            self.slot_idx - 1
-        };
-
-        if outward {
-            self.slot_idx += 1;
-        } else {
-            self.slot_idx -= 1;
-        }
-
-        h.slot_value = unsafe { *tape.get_unchecked(next) };
-        h.mask = if RIGHT { 1 } else { 1 << 63 };
-    }
-
-    #[inline(always)]
-    fn side_cross<const RIGHT: bool>(&mut self, mut h: Head) -> Head {
-        self.tape_side = !self.tape_side;
-
         if RIGHT {
-            unsafe { *self.left_tape.get_unchecked_mut(0) = h.slot_value };
-            h.slot_value = unsafe { *self.right_tape.get_unchecked(0) };
+            self.left_tape.push(h.slot_value);
+            h.slot_value = self.right_tape.pop().unwrap_or(0);
             h.mask = 1;
         } else {
-            unsafe { *self.right_tape.get_unchecked_mut(0) = h.slot_value };
-            h.slot_value = unsafe { *self.left_tape.get_unchecked(0) };
+            self.right_tape.push(h.slot_value);
+            h.slot_value = self.left_tape.pop().unwrap_or(0);
             h.mask = 1 << 63;
         }
-        h
     }
 }

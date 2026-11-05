@@ -14,6 +14,5 @@ devenv.local.yaml
 /target
 
 # scripts
-failed_machines.txt
-machine_output.txt
 machines.txt
+/out

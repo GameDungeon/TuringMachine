@@ -1,13 +1,9 @@
-{
-  pkgs,
-  lib,
-  config,
-  inputs,
-  ...
-}: {
+{pkgs, ...}: {
   packages = [
     pkgs.git
     pkgs.hyperfine
+    pkgs.perf
+    pkgs.python3
   ];
 
   languages.rust = {
@@ -15,10 +11,7 @@
     channel = "nightly";
   };
 
-  env = {
-    # MACHINE = "1RB1LC_1RC1RB_1RD0LE_1LA1LD_1RZ0LA";
-
-    # Antihydra
-    MACHINE = "1RB1RA_0LC1LE_1LD1LC_1LA0LB_1LF1RE_---0RA";
-  };
+  scripts.turing.exec = ''
+    python turing.py $@
+  '';
 }
