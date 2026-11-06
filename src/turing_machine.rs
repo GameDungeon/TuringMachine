@@ -1,3 +1,7 @@
+use std::alloc::{self, Layout};
+use std::ops::{Deref, DerefMut};
+use std::ptr::{self, NonNull};
+
 #[derive(Clone, Copy)]
 pub struct Head {
     mask: u64,
@@ -43,75 +47,6 @@ impl Head {
             tape.cross::<RIGHT>(self)
         }
     }
-
-    // #[inline(always)]
-    // pub fn shift_rule<const RIGHT: bool, const SYMBOL: bool, const WRITE: bool>(
-    //     &mut self,
-    //     tape: &mut Tape,
-    //     mut budget: u64,
-    // ) -> u64 {
-    //     let start = budget;
-    //     let full: u64 = if SYMBOL { u64::MAX } else { 0 };
-    //     let filled: u64 = if WRITE { u64::MAX } else { 0 };
-
-    //     loop {
-    //         let p = self.mask.trailing_zeros();
-    //         let diff = if SYMBOL {
-    //             !self.slot_value
-    //         } else {
-    //             self.slot_value
-    //         };
-
-    //         let (dist, to_edge) = if RIGHT {
-    //             ((diff >> p).trailing_zeros(), 64 - p)
-    //         } else {
-    //             ((diff << (63 - p)).leading_zeros(), p + 1)
-    //         };
-
-    //         let n = (dist.min(to_edge)).min(budget as u32);
-    //         if n == 0 {
-    //             return start - budget;
-    //         }
-    //         budget -= n as u64;
-
-    //         if SYMBOL != WRITE {
-    //             let ones = u64::MAX >> (64 - n);
-    //             let range = if RIGHT {
-    //                 ones << p
-    //             } else {
-    //                 ones << (p + 1 - n)
-    //             };
-
-    //             if WRITE {
-    //                 self.slot_value |= range
-    //             } else {
-    //                 self.slot_value &= !range
-    //             }
-    //         }
-
-    //         if n == to_edge {
-    //             tape.cross::<RIGHT>(self);
-
-    //             // Tight loop: skip whole uniform words while the budget covers all 64 cells.
-    //             while self.slot_value == full && budget >= 64 {
-    //                 if SYMBOL != WRITE {
-    //                     self.slot_value = filled;
-    //                 }
-    //                 tape.cross::<RIGHT>(self); // stores `filled`, loads the next word
-    //                 budget -= 64;
-    //             }
-    //             // Fall through to the general scan: handles a mixed word, a word that
-    //             // starts with a different symbol (n == 0 -> return), or budget < 64.
-    //         } else {
-    //             if RIGHT {
-    //                 self.mask <<= n
-    //             } else {
-    //                 self.mask >>= n
-    //             }
-    //             return start - budget;
-    //         }
-    //     }
-    // }
 
     #[inline(always)]
     pub fn shift_rule<const RIGHT: bool, const SYMBOL: bool, const WRITE: bool>(
@@ -213,28 +148,127 @@ impl Head {
 }
 
 pub struct Tape {
-    left_tape: Vec<u64>,
-    right_tape: Vec<u64>,
+    ptr: NonNull<u64>,
+    len: usize,
+    idx: usize,
 }
 
 impl Tape {
     pub fn new() -> Self {
-        Self {
-            left_tape: vec![0],
-            right_tape: vec![0],
-        }
+        let len = 128;
+        let layout = Layout::array::<u64>(len).expect("Allocation too large");
+        let new_ptr = unsafe { alloc::alloc_zeroed(layout) };
+
+        let ptr = match NonNull::new(new_ptr as *mut u64) {
+            Some(p) => p,
+            None => alloc::handle_alloc_error(layout),
+        };
+
+        Self { ptr, len, idx: 64 }
     }
 
     #[inline(always)]
     pub fn cross<const RIGHT: bool>(&mut self, h: &mut Head) {
+        let idx = self.idx;
+
+        unsafe { *self.get_unchecked_mut(idx) = h.slot_value };
+
         if RIGHT {
-            self.left_tape.push(h.slot_value);
-            h.slot_value = self.right_tape.pop().unwrap_or(0);
-            h.mask = 1;
+            let next = idx + 1;
+
+            if next >= self.len {
+                self.grow_forward();
+            }
+
+            self.idx = next;
         } else {
-            self.right_tape.push(h.slot_value);
-            h.slot_value = self.left_tape.pop().unwrap_or(0);
-            h.mask = 1 << 63;
+            if idx == 0 {
+                self.grow_backward();
+            }
+            self.idx -= 1;
+        }
+
+        h.slot_value = unsafe { *self.get_unchecked(self.idx) };
+        h.mask = if RIGHT { 1 } else { 1 << 63 };
+    }
+
+    #[inline(always)]
+    pub fn flush(&mut self, h: &Head) {
+        let idx = self.idx;
+        unsafe { *self.get_unchecked_mut(idx) = h.slot_value };
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_forward(&mut self) {
+        let new_len = self.len * 2;
+
+        let new_layout = Layout::array::<u64>(new_len).expect("Allocation too large");
+        let old_layout = Layout::array::<u64>(self.len).unwrap();
+
+        let old_ptr = self.ptr.as_ptr() as *mut u8;
+        let new_ptr = unsafe { alloc::realloc(old_ptr, old_layout, new_layout.size()) };
+
+        self.ptr = match NonNull::new(new_ptr as *mut u64) {
+            Some(p) => p,
+            None => alloc::handle_alloc_error(new_layout),
+        };
+
+        unsafe {
+            ptr::write_bytes(self.ptr.as_ptr().add(self.len), 0, self.len);
+        }
+
+        self.len = new_len;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_backward(&mut self) {
+        debug_assert!(self.idx == 0, "self.idx must be 0 before growing");
+
+        let old_len = self.len;
+        let new_len = old_len * 2;
+
+        let new_layout = Layout::array::<u64>(new_len).unwrap();
+        let old_layout = Layout::array::<u64>(old_len).unwrap();
+
+        let old_ptr = self.ptr.as_ptr() as *mut u8;
+        let new_ptr = unsafe { alloc::realloc(old_ptr, old_layout, new_layout.size()) };
+
+        let new_ptr = match NonNull::new(new_ptr as *mut u64) {
+            Some(p) => p,
+            None => alloc::handle_alloc_error(new_layout),
+        };
+
+        unsafe {
+            ptr::copy_nonoverlapping(new_ptr.as_ptr(), new_ptr.as_ptr().add(old_len), old_len);
+            ptr::write_bytes(new_ptr.as_ptr(), 0, old_len);
+        }
+
+        self.ptr = new_ptr;
+        self.len = new_len;
+        self.idx = old_len;
+    }
+}
+
+impl Deref for Tape {
+    type Target = [u64];
+    fn deref(&self) -> &[u64] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl DerefMut for Tape {
+    fn deref_mut(&mut self) -> &mut [u64] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for Tape {
+    fn drop(&mut self) {
+        let layout = Layout::array::<u64>(self.len).unwrap();
+        unsafe {
+            alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout);
         }
     }
 }

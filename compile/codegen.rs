@@ -1,13 +1,13 @@
 use std::env;
 
-use crate::analysis::Analysis;
+use crate::inline;
 use crate::ir::*;
 use crate::parser::state_name;
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 
-fn fn_ident(id: StateId) -> Ident {
-    format_ident!("state_{}", state_name(id))
+fn fn_ident(s: &StateFn) -> Ident {
+    format_ident!("state_{}{}", state_name(s.state), s.ctx.suffix())
 }
 
 /// Halt code = state * 2 + symbol. `Z` (u8::MAX) means "out of budget".
@@ -15,23 +15,27 @@ fn halt_code(state: StateId, symbol: Sym) -> u8 {
     (state * 2 + symbol as usize) as u8
 }
 
-pub fn emit(ir: &Ir, an: &Analysis, machine: &str) -> TokenStream {
-    let k = an.threshold(0);
-    let names: Vec<String> = (0..ir.states.len())
+pub fn emit(ir: &Ir, machine: &str) -> TokenStream {
+    let names: Vec<String> = (0..ir.n_states)
         .map(|i| state_name(i).to_string().to_uppercase())
         .collect();
     let n = names.len();
+    let live = inline::reachable(ir);
+    let fn_names: Vec<Ident> = ir.states.iter().map(fn_ident).collect();
     let fns: Vec<TokenStream> = ir
         .states
         .iter()
-        .filter(|s| an.is_live(s.id))
-        .map(|s| emit_state(s, an))
+        .filter(|s| live[s.id])
+        .map(|s| emit_state(s, &fn_names))
         .collect();
+    let entry = &fn_names[0];
 
     let steps = env::var_os("STEPS")
         .map(|x| x.to_str().unwrap().parse().unwrap())
         .unwrap_or(10u64.pow(10))
-        + an.chain.iter().max().unwrap();
+        + 20;
+
+    assert!(steps >= 100, "Must perform at least 100 steps");
 
     let write_out = env::var_os("OUTPUT_FILE")
         .map(|x| x.into_string().expect("Sting must be unicode"))
@@ -48,12 +52,7 @@ pub fn emit(ir: &Ir, an: &Analysis, machine: &str) -> TokenStream {
             head: Head,
             tape: &mut Tape
         ) -> (u64, &'static str, bool) {
-            // Establishes the "budget > k" invariant for a start state that is unchecked.
-            if STEPS <= #k {
-                return (0, "HOLDOUT", false);
-            }
-
-            let (left, code) = state_a(head, tape, STEPS);
+            let (left, code) = #entry(head, tape, STEPS);
 
             if code == HOLDOUT {
                 (0, "HOLDOUT", false)
@@ -66,103 +65,66 @@ pub fn emit(ir: &Ir, an: &Analysis, machine: &str) -> TokenStream {
     }
 }
 
-fn emit_state(s: &StateFn, an: &Analysis) -> TokenStream {
-    let k = an.threshold(s.id);
-    let name = fn_ident(s.id);
-
-    let inline = if an.is_inlined(s.id) {
-        quote! {#[inline(always)]}
-    } else {
-        quote! {}
-    };
-
-    let entry_check = if an.is_checked(s.id) {
-        quote! {
-           if step_budget <= #k {
-               return (0, HOLDOUT);
-           }
-        }
-    } else {
-        quote! {}
-    };
-
-    let (mut_budget, body) = match &s.body {
-        Body::Straight(b) => (quote! {}, emit_block(b)),
-        Body::Switch {
-            common,
-            arms: [zero, one],
-        } => {
-            let (zero, one) = (emit_block(zero), emit_block(one));
-            if common.is_empty() {
-                (quote! {}, quote! { if head.read() { #one } else { #zero } })
-            } else {
-                let ops = common.iter().map(emit_op);
-                // Read BEFORE the hoisted ops: they rewrite or leave the cell.
-                (
-                    quote! {},
-                    quote! {
-                        let sym = head.read();
-                        #(#ops)*
-                        if sym { #one } else { #zero }
-                    },
-                )
-            }
-        }
-        Body::ScanThen { run, rest } => {
-            let Run { dir, read, write } = *run;
-            let cond = match read {
-                Sym::S0 => quote! { !head.read() },
-                Sym::S1 => quote! { head.read() },
-            };
-            let rest = emit_block(rest);
-            (
-                quote! { mut },
-                quote! {
-                    if #cond {
-                        step_budget = head.shift_rule::<#dir, #read, #write>(tape, step_budget);
-                        // let n = head.shift_rule::<#dir, #read, #write>(tape, step_budget);
-                        // step_budget -= n;
-                        if step_budget <= #k {
-                            return (0, HOLDOUT);
-                        }
-                    }
-                    #rest
-                },
-            )
-        }
-    };
-
-    quote! {
-        #inline
-        #[allow(unused_mut, unused_variables, clippy::needless_return)]
-        fn #name(mut head: Head, tape: &mut Tape, #mut_budget step_budget: u64) -> (u64, u8) {
-            #entry_check
-            #body
-        }
-    }
+fn emit_ops(ops: &[Op]) -> Vec<TokenStream> {
+    ops.iter()
+        .map(|op| match *op {
+            Op::Flip => quote! { head.flip(); },
+            Op::Write(s) => quote! { head.write::<#s>(); },
+            Op::Shift(dir) => quote! { head.shift::<#dir>(tape); },
+            Op::Step(n) => quote! { step_budget -= #n; },
+            Op::Check(t) => quote! { if step_budget <= #t { return (0, HOLDOUT); } },
+        })
+        .collect()
 }
 
-fn emit_block(b: &Block) -> TokenStream {
-    let ops = b.ops.iter().map(emit_op);
-    let term = match b.term {
-        Term::Tail(next) => {
-            let f = fn_ident(next);
-            quote! { become #f(head, tape, step_budget - 1) }
+fn emit_block(b: &Block, names: &[Ident]) -> TokenStream {
+    let ops = emit_ops(&b.ops);
+    let term = match &b.term {
+        Term::Tail(n) => {
+            let f = &names[*n];
+            quote! { become #f(head, tape, step_budget) }
         }
         Term::Halt { state, symbol } => {
-            let code = halt_code(state, symbol);
-            quote! {
-                return (step_budget - 1, #code)
-            }
+            let code = halt_code(*state, *symbol);
+            quote! { return (step_budget, #code) }
+        }
+        Term::Branch { arms } => {
+            let a0 = emit_block(&arms[0], names);
+            let a1 = emit_block(&arms[1], names);
+            quote! { if head.read() { #a1 } else { #a0 } }
         }
     };
     quote! { #(#ops)* #term }
 }
 
-fn emit_op(op: &Op) -> TokenStream {
-    match *op {
-        Op::Flip => quote! { head.flip(); },
-        Op::Write(s) => quote! { head.write::<#s>(); },
-        Op::Shift(dir) => quote! { head.shift::<#dir>(tape); },
+fn emit_state(s: &StateFn, names: &[Ident]) -> TokenStream {
+    let name = names[s.id].clone();
+
+    let body = match &s.body {
+        Body::Code(b) => emit_block(b, names),
+        Body::ScanThen { run, rest, post } => {
+            let Run { dir, read, write } = *run;
+            let method = format_ident!("shift_rule");
+            let cond = if read == Sym::S1 {
+                quote! { head.read() }
+            } else {
+                quote! { !head.read() }
+            };
+            let rest = emit_block(rest, names);
+            quote! {
+                if #cond {
+                    step_budget = head.#method::<#dir, #read, #write>(tape, step_budget);
+                    if step_budget <= #post { return (0, HOLDOUT); }
+                }
+                #rest
+            }
+        }
+    };
+
+    quote! {
+        #[allow(unused_mut, unused_variables, clippy::needless_return)]
+        fn #name(mut head: Head, tape: &mut Tape, mut step_budget: u64) -> (u64, u8) {
+            #body
+        }
     }
 }
